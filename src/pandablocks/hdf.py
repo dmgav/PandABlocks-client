@@ -206,7 +206,7 @@ class HDFWriter(Pipeline):
             if len(c) and isinstance(c[0], np.int32):
                 c = [np.float64(_) for _ in c]
                 t = "float64"
-            ds_emit = {"dtype": t, "size": int(dataset.shape[0])}
+            ds_emit = {"dtype": t, "size": len(c), "starting_sample_number": dataset.shape[0]}
             ds_emit["data"] = c
             data_emit["datasets"][str(dataset.name)] = ds_emit
             # ==================================================
