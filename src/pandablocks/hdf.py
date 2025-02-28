@@ -6,12 +6,16 @@ from typing import Any, Callable, Optional
 
 import h5py
 import numpy as np
+import zmq
+import os
+
 
 from pandablocks.commands import Arm
 
 from .asyncio import AsyncioClient
 from .connections import GATE_DURATION_FIELD, SAMPLES_FIELD
 from .responses import EndData, EndReason, FieldCapture, FrameData, ReadyData, StartData
+import json
 
 # Define the public API of this module
 __all__ = [
@@ -71,6 +75,30 @@ class Pipeline(threading.Thread):
         """Stop the processing after the current queue has been emptied"""
         self.queue.put(STOP)
 
+# 0MQ publishing ====================================
+
+class ZMQPublisher:
+    """Class to handle publishing messages to a 0MQ PUB socket"""
+
+    def __init__(self):
+        self.socket_is_active = False
+        address = os.getenv("PANDA_IOC_PUB_ZMQ_ADDRESS", None)  # Address is in the form tcp://<address>:<port>
+        if address:
+            context = zmq.Context()
+            self.socket = context.socket(zmq.PUB)
+            self.socket.bind(address)
+            self.socket_is_active = True
+
+    def publish(self, message: dict):
+        if self.socket_is_active:
+            # self.socket.send_string(json.dumps(message))
+            self.socket.send_json(message)
+
+# Initialize the ZMQPublisher
+zmq_publisher = ZMQPublisher()
+
+# ==================================================
+
 
 class HDFWriter(Pipeline):
     """Write an HDF file per data collection. Each field will be
@@ -108,6 +136,7 @@ class HDFWriter(Pipeline):
             list: self.write_frame,
             EndData: self.close_file,
         }
+        self.n_emitted_frames = 0  # 0MQ publishing =========================
 
     def create_dataset(self, field: FieldCapture, raw: bool):
         # Data written in a big stack, growing in that dimension
@@ -147,23 +176,58 @@ class HDFWriter(Pipeline):
         if data.hw_time_offset_ns is not None:
             self.hdf_file.attrs["hw_time_offset_ns"] = data.hw_time_offset_ns
 
+        # 0MQ publishing ====================================
+        data_emit = {
+            "msg_type": "start",
+            "arm_time": data.arm_time,
+            "start_time": data.start_time,
+            "hw_time_offset_ns": data.hw_time_offset_ns,
+        }
+        self.n_emitted_frames = 0
+        zmq_publisher.publish(data_emit)
+        # ==================================================
+
         logging.info(
             f"Opened '{self.file_path}' with {data.sample_bytes} byte samples "
             f"stored in {len(self.datasets)} datasets"
         )
 
     def write_frame(self, data: list[np.ndarray]):
+        # OMQ publishing code ==============================
+        data_emit = {"msg_type": "data", "frame_number": self.n_emitted_frames, "datasets": {}}
+        self.n_emitted_frames += 1
+        # ==================================================
+
         for dataset, column in zip(self.datasets, data):
             # Append to the end, flush when done
+
+            # OMQ publishing code ==============================
+            t, c = str(dataset.dtype), list(column)
+            if len(c) and isinstance(c[0], np.int32):
+                c = [np.float64(_) for _ in c]
+                t = "float64"
+            ds_emit = {"dtype": t, "size": int(dataset.shape[0])}
+            ds_emit["data"] = c
+            data_emit["datasets"][str(dataset.name)] = ds_emit
+            # ==================================================
+
+            ##data_emit[str(dataset.name)] = list(column)
             written = dataset.shape[0]
             dataset.resize((written + column.shape[0],))
             dataset[written:] = column
             dataset.flush()
 
+        zmq_publisher.publish(data_emit)  # 0MQ publishing ==============================
+
         # Return the number of samples written
         return dataset.shape[0]
 
     def close_file(self, data: EndData):
+        # OMQ publishing code ==============================
+        data_emit = {"msg_type": "stop", "emitted_frames": self.n_emitted_frames}
+        zmq_publisher.publish(data_emit)
+        # ==================================================
+
         assert self.hdf_file, "File not open yet"
         self.hdf_file.close()
         self.hdf_file = None
@@ -172,6 +236,7 @@ class HDFWriter(Pipeline):
             f"samples. End reason is '{data.reason.value}'"
         )
         self.file_path = ""
+
 
 
 class FrameProcessor(Pipeline):
